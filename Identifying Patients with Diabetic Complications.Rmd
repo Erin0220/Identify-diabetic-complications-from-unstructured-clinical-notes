@@ -1,0 +1,156 @@
+---
+title: "Identifying Patients with Diabetic Complications"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+## Purpose of the Project
+#### This project applies the text processing and clinical natural language processing techniques learned in this course to a real-world clinical problem: identifying diabetic complications from unstructured clinical notes. Using a corpus of notes from patients with diabetes, the goal is to determine whether a note documents the presence of diabetic complications and, if so, which type of complication is described.
+
+#### Specifically, this project focuses on identifying three common diabetic complications—neuropathy, nephropathy, and retinopathy—by analyzing free-text clinical documentation. A keyword window–based approach is used to capture local clinical context around diabetes-related terms, while exclusion rules are applied to remove negated mentions and references to family history. The resulting predictions are evaluated against a gold-standard dataset to assess model performance.
+
+#### By completing this project, the workflow demonstrates how clinical text can be systematically processed to extract meaningful phenotypic information that may support clinical research, population health studies, and decision support applications.
+
+## Getting data
+#### Load packages, connect to BigQuery, then downloads two talbes into R
+```{r}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(magrittr)
+library(bigrquery)
+library(DBI)
+library(caret)
+
+con <- DBI::dbConnect(
+  drv = bigquery(),
+  project = "learnclinicaldatascience"
+)
+
+my_project <- "learnclinicaldatascience"
+
+patient <- bq_project_query(
+  my_project,
+  "
+  SELECT *
+  FROM `course4_data.diabetes_goldstandard`
+  "
+) %>% bq_table_download()
+
+notes <- bq_project_query(
+  my_project,
+  "
+  SELECT *
+  FROM `course4_data.diabetes_notes`
+  "
+) %>% bq_table_download()
+```
+## Feature engineering: Key window technique
+
+#### First, create text windows for notes containing the word related to diabetes (window size = 20 words total; ±10 words).
+```{r}
+extract_text_window <- function(dataframe, keyword, half_window_size) {
+  dataframe %>%
+    group_by(NOTE_ID) %>%
+    mutate(WORDS = TEXT) %>%
+    separate_rows(WORDS, sep = "[ \n]+") %>%
+    mutate(
+      INDEX = row_number(),
+      WINDOW_START = if_else(INDEX - half_window_size < 1, 1L, INDEX - half_window_size),
+      WINDOW_END   = if_else(INDEX + half_window_size > max(INDEX), max(INDEX), INDEX + half_window_size),
+      WINDOW = stringr::word(TEXT, start = WINDOW_START, end = WINDOW_END, sep = "[ \n]+")
+    ) %>%
+    ungroup() %>%
+    filter(str_detect(WORDS, regex(keyword, ignore_case = TRUE)))
+}
+```
+
+```{r}
+diabetes_notes_window <- notes %>%
+  extract_text_window(
+    keyword = "(?<![a-zA-Z])diabet(es|ic)?(?![a-zA-Z])",
+    half_window_size = 10
+  )
+```
+## Exclusion rules (remove negations / family history)
+```{r}
+diabetes_notes_clean <- diabetes_notes_window %>%
+  mutate(
+    EXCLUDE = case_when(
+      str_detect(WINDOW, regex("no history of (?<![a-zA-Z])diabet(es|ic)?(?![a-zA-Z])", ignore_case = TRUE)) ~ 1,
+      str_detect(WINDOW, regex("den(ies|y)? any comorbid complications", ignore_case = TRUE)) ~ 1,
+      str_detect(WINDOW, regex("family history", ignore_case = TRUE)) ~ 1,
+      str_detect(WINDOW, regex("negative for (?<![a-zA-Z])diabet(es|ic)?(?![a-zA-Z])", ignore_case = TRUE)) ~ 1,
+      str_detect(WINDOW, regex("(father|mother) (also)? (?<![a-zA-Z])diabet(es|ic)?(?![a-zA-Z])", ignore_case = TRUE)) ~ 1,
+      str_detect(WINDOW, regex("no weakness, numbness or tingling", ignore_case = TRUE)) ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  filter(EXCLUDE != 1)
+```
+## Identify complications from windows
+```{r}
+diabetes_complic <- diabetes_notes_clean %>%
+  mutate(
+    COMPLICATIONS = case_when(
+      str_detect(WINDOW, regex("(?<![a-zA-Z])neuropath(y|ic)?(?![a-zA-Z])", ignore_case = TRUE)) ~ "neuropathy",
+      str_detect(WINDOW, regex("diabetic nerve pain", ignore_case = TRUE)) ~ "neuropathy",
+      str_detect(WINDOW, regex("tingling", ignore_case = TRUE)) ~ "neuropathy",
+
+      str_detect(WINDOW, regex("(?<![a-zA-Z])nephropathy(?![a-zA-Z])", ignore_case = TRUE)) ~ "nephropathy",
+      str_detect(WINDOW, regex("renal (insufficiency|disease)", ignore_case = TRUE)) ~ "nephropathy",
+
+      str_detect(WINDOW, regex("(?<![a-zA-Z])retinopath(y|ic)?(?![a-zA-Z])", ignore_case = TRUE)) ~ "retinopathy",
+
+      TRUE ~ ""
+    )
+  ) %>%
+  arrange(desc(COMPLICATIONS))
+```
+## Build note-level predictions
+```{r}
+pred_neuro <- diabetes_complic %>%
+  filter(COMPLICATIONS == "neuropathy") %>%
+  distinct(NOTE_ID) %>%
+  mutate(predicted_neuropathy = 1)
+
+pred_nephro <- diabetes_complic %>%
+  filter(COMPLICATIONS == "nephropathy") %>%
+  distinct(NOTE_ID) %>%
+  mutate(predicted_nephropathy = 1)
+
+pred_retino <- diabetes_complic %>%
+  filter(COMPLICATIONS == "retinopathy") %>%
+  distinct(NOTE_ID) %>%
+  mutate(predicted_retinopathy = 1)
+```
+## Evaluate performance
+```{r}
+getStats <- function(df, ...) {
+  df %>%
+    select(...) %>%
+    mutate(across(everything(), ~ factor(.x, levels = c(1, 0)))) %>%
+    table() %>%
+    confusionMatrix()
+}
+eval_df <- patient %>%
+  left_join(pred_neuro,  by = "NOTE_ID") %>%
+  left_join(pred_nephro, by = "NOTE_ID") %>%
+  left_join(pred_retino, by = "NOTE_ID") %>%
+  mutate(
+    predicted_neuropathy  = coalesce(predicted_neuropathy, 0),
+    predicted_nephropathy = coalesce(predicted_nephropathy, 0),
+    predicted_retinopathy = coalesce(predicted_retinopathy, 0),
+    predicted_complic = if_else(
+      predicted_neuropathy == 1 | predicted_nephropathy == 1 | predicted_retinopathy == 1,
+      1, 0
+    )
+  ) %>%
+  select(NOTE_ID, ANY_DIABETIC_COMPLICATION, predicted_complic)
+
+getStats(eval_df, predicted_complic, ANY_DIABETIC_COMPLICATION)
+```
+##### From the results, 22 cases were true positives and 110 were true negatives (correctly identified) while 4 were false positives and 5 were false negatives.
+
+##### In conclusion, the accuracy of this keyword window technique used is 0.9362, while the sensitivity is 0.8148 and specificity is 0.9649. There is a balance of sensitivity and specificity, with a relatively high accuracy. Therefore, this method can be used to classify such clinical notes in the future. We could try to use the note section technique as an alternative method where we use the context provided by the note section to understand the meaning of the keyword matches in the text.
